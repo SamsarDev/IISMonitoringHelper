@@ -1,0 +1,23 @@
+# .NET build output and IDE state
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+TestResults/
+coverage/
+
+# Local NuGet packages staged for Docker builds (scripts/stage-packages)
+artifacts/
+
+# Environment files and local secrets (secrets live only in environment variables)
+.env
+.env.*
+!.env.example
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
