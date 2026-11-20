@@ -9,6 +9,8 @@ public sealed class MonitorConfig
     public string OutputDirectory { get; set; } = "./monitor-output";
     public List<int> DbPorts { get; set; } = [1433];
     public List<string> AppPoolFilter { get; set; } = [];
+    public List<string> NodeIgnorePatterns { get; set; } = [];
+    public int AnomalyCooldownSeconds { get; set; } = 300;
     public int EventLogLookbackMinutes { get; set; } = 5;
     public bool RunOnce { get; set; }
     public ThresholdConfig Thresholds { get; set; } = new();
@@ -25,6 +27,12 @@ public sealed class MonitorConfig
         new(AppPoolFilter.Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.Trim()),
             StringComparer.OrdinalIgnoreCase);
 
+    public IReadOnlyList<string> GetNormalizedNodeIgnorePatterns() =>
+        NodeIgnorePatterns
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .ToList();
+
     public void Normalize()
     {
         if (SampleIntervalSeconds < 1)
@@ -37,6 +45,11 @@ public sealed class MonitorConfig
             CheckpointIntervalMinutes = 1;
         }
 
+        if (AnomalyCooldownSeconds < 0)
+        {
+            AnomalyCooldownSeconds = 0;
+        }
+
         if (EventLogLookbackMinutes < 0)
         {
             EventLogLookbackMinutes = 0;
@@ -47,6 +60,7 @@ public sealed class MonitorConfig
             OutputDirectory = "./monitor-output";
         }
 
+        NodeIgnorePatterns ??= [];
         Thresholds ??= new ThresholdConfig();
     }
 }
@@ -66,6 +80,8 @@ public sealed class ThresholdConfig
     public int HttpQueueWarningCount { get; set; } = 20;
     public double ThreadContentionPerSecWarning { get; set; } = 25.0;
     public double ExceptionsPerSecWarning { get; set; } = 20.0;
+    public double HighGcTimeWarningPercent { get; set; } = 20.0;
+    public double HighGcTimeCriticalPercent { get; set; } = 40.0;
     public int NodeZombieUptimeMinutes { get; set; } = 30;
     public double NodeStalledCpuDeltaMs { get; set; } = 100.0;
     public int IncidentMergeGapSeconds { get; set; } = 180;

@@ -32,6 +32,7 @@ public static class Program
         }
 
         using var cts = new CancellationTokenSource();
+        using var shutdownCompleted = new ManualResetEventSlim(false);
         ConsoleCancelEventHandler cancelHandler = (_, e) =>
         {
             e.Cancel = true;
@@ -46,6 +47,7 @@ public static class Program
                 {
                     cts.Cancel();
                 }
+                shutdownCompleted.Wait(TimeSpan.FromSeconds(3));
             }
             catch (ObjectDisposedException) { }
         };
@@ -76,6 +78,7 @@ public static class Program
         }
         finally
         {
+            shutdownCompleted.Set();
             Console.CancelKeyPress -= cancelHandler;
             AppDomain.CurrentDomain.ProcessExit -= exitHandler;
         }
@@ -145,6 +148,14 @@ public static class Program
                         .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                         .ToList();
                     break;
+                case "--anomaly-cooldown-seconds":
+                    config.AnomalyCooldownSeconds = int.Parse(RequireValue(args, ref i, arg), CultureInfo.InvariantCulture);
+                    break;
+                case "--node-ignore":
+                    config.NodeIgnorePatterns = RequireValue(args, ref i, arg)
+                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .ToList();
+                    break;
                 case "--once":
                     config.RunOnce = true;
                     break;
@@ -178,9 +189,11 @@ public static class Program
               --interval-seconds <num>    Sampling interval in seconds (default: 15)
               --checkpoint-minutes <num>  Executive summary checkpoint interval (default: 60)
               --output <path>             Output directory for reports (default: ./monitor-output)
-              --db-ports <p1,p2>          Comma-separated DB ports to track (default: 1433)
-              --app-pools <a1,a2>         Comma-separated IIS AppPool names to filter (default: all)
-              --once                      Capture a single sample and exit
+              --db-ports <p1,p2>                 Comma-separated DB ports to track (default: 1433)
+              --app-pools <a1,a2>                Comma-separated IIS AppPool names to filter (default: all)
+              --anomaly-cooldown-seconds <num>   Cooldown per (Code, Target) in seconds (default: 300)
+              --node-ignore <p1,p2>              Comma-separated Node job/cmdline substrings to ignore
+              --once                             Capture a single sample and exit
               -h, --help                  Show this help message
             """);
     }

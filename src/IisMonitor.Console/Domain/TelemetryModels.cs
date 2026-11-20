@@ -22,7 +22,8 @@ public sealed record IisWorkerProcessInfo(
     double? TotalProcessorTimeMs,
     DateTimeOffset? StartTimeUtc,
     IReadOnlyList<ActiveRequestInfo> ActiveRequests,
-    IReadOnlyList<string> BoundSites);
+    IReadOnlyList<string> BoundSites,
+    double? CpuPercent = null);
 
 public sealed record IisCollectionResult(
     string Source,
@@ -212,7 +213,25 @@ public sealed record AppPoolHealthSummary(
     long MaxRequestElapsedMs,
     double MaxHttpQueueSize,
     double MaxWorkingSetMb,
-    IReadOnlyList<string> TopHungUrls);
+    IReadOnlyList<string> TopHungUrls,
+    double? StartWorkingSetMb = null,
+    double? AvgWorkingSetMb = null,
+    double? EndWorkingSetMb = null,
+    double? AvgCpuPercent = null,
+    double? MaxCpuPercent = null,
+    double? MaxGcPercent = null,
+    double? MaxGen2HeapMb = null,
+    double? MaxTotalHeapMb = null,
+    double? MaxLogicalThreads = null);
+
+public sealed record EventLogSignatureSummary(
+    string Source,
+    int EventId,
+    string Level,
+    string Signature,
+    int Count,
+    DateTimeOffset FirstSeenUtc,
+    DateTimeOffset LastSeenUtc);
 
 public sealed record NodeJobHealthSummary(
     string JobLabel,
@@ -255,4 +274,5 @@ public sealed record ExecutiveSummaryReport(
     IReadOnlyList<AppPoolHealthSummary> AppPools,
     IReadOnlyList<NodeJobHealthSummary> NodeJobs,
     IReadOnlyList<IncidentWindowSummary> TopIncidents,
-    IReadOnlyList<string> GeneratedFiles);
+    IReadOnlyList<string> GeneratedFiles,
+    IReadOnlyList<EventLogSignatureSummary>? TopEventLogSignatures = null);

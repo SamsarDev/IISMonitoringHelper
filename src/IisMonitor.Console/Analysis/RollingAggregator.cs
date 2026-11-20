@@ -1,3 +1,4 @@
+using IisMonitor.Collectors;
 using IisMonitor.Domain;
 
 namespace IisMonitor.Analysis;
@@ -6,6 +7,7 @@ public sealed class RollingAggregator
 {
     private const int MaxStoredIncidents = 500;
     private const int MaxEnvironmentWarnings = 20;
+    private const int MaxEventSignatures = 500;
 
     private readonly string _machineName;
     private readonly DateTimeOffset _runStartUtc;
@@ -17,8 +19,9 @@ public sealed class RollingAggregator
     private readonly Dictionary<string, double> _lastReclaimedByPool = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _environmentWarnings = new(StringComparer.Ordinal);
     private readonly List<IncidentAccumulator> _incidents = [];
+    private readonly Dictionary<string, IncidentAccumulator> _activeIncidents = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<(string Source, int EventId, string Signature), EventLogSignatureAccumulator> _eventSignatures = new();
 
-    private IncidentAccumulator? _activeIncident;
     private int _nextIncidentId = 1;
     private long _totalSamples;
     private DateTimeOffset _lastSampleUtc;
@@ -57,11 +60,17 @@ public sealed class RollingAggregator
             acc.RecordWorker(w, snapshot.Tcp.ByPid.GetValueOrDefault(w.Pid), _config.Thresholds.HungRequestThresholdMs);
         }
 
-        // Update ADO.NET stats per AppPool
+        // Update ADO.NET stats per IIS AppPool (skip non-IIS ADO.NET instances such as SSRS or service runners)
+        var activeAdoInstances = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var ado in snapshot.AdoNet.Instances)
         {
-            string poolKey = ado.AppPoolName ?? ado.InstanceName;
-            var acc = GetOrCreateAppPool(poolKey);
+            if (string.IsNullOrWhiteSpace(ado.AppPoolName))
+            {
+                continue;
+            }
+
+            activeAdoInstances.Add(ado.InstanceName);
+            var acc = GetOrCreateAppPool(ado.AppPoolName);
             double reclaimedDelta = 0;
             if (ado.NumberOfReclaimedConnections.HasValue)
             {
@@ -75,12 +84,31 @@ public sealed class RollingAggregator
             acc.RecordAdoNet(ado, reclaimedDelta);
         }
 
+        // Prune departed ADO.NET instances to prevent unbounded memory growth over 72h.
+        if (_lastReclaimedByPool.Count > 0)
+        {
+            var staleAdo = _lastReclaimedByPool.Keys.Where(k => !activeAdoInstances.Contains(k)).ToList();
+            foreach (string key in staleAdo)
+            {
+                _lastReclaimedByPool.Remove(key);
+            }
+        }
+
         // Update HTTP queue stats per AppPool
         foreach (var hq in snapshot.AspNetAndClr.HttpQueues)
         {
             if (_appPools.TryGetValue(hq.AppPoolName, out var acc) && hq.CurrentQueueSize.HasValue)
             {
                 acc.RecordHttpQueue(hq.CurrentQueueSize.Value);
+            }
+        }
+
+        // Update CLR stats per AppPool
+        foreach (var clr in snapshot.AspNetAndClr.ClrProcesses)
+        {
+            if (!string.IsNullOrWhiteSpace(clr.AppPoolName))
+            {
+                GetOrCreateAppPool(clr.AppPoolName).RecordClr(clr);
             }
         }
 
@@ -95,7 +123,13 @@ public sealed class RollingAggregator
             acc.Record(n);
         }
 
-        // Update anomaly counts & cluster into IncidentWindows
+        // Track grouped EventLog signatures
+        RecordEventSignatures(snapshot.NewEvents);
+
+        // Close any active incidents whose merge gap has elapsed
+        CloseExpiredActiveIncidents(snapshot.TimestampUtc);
+
+        // Update anomaly counts & cluster into scoped IncidentWindows
         if (anomalies.Count > 0)
         {
             foreach (var anomaly in anomalies)
@@ -113,7 +147,7 @@ public sealed class RollingAggregator
                 }
             }
 
-            ClusterAnomaliesIntoIncident(snapshot, anomalies);
+            ClusterAnomaliesIntoIncidents(snapshot, anomalies);
         }
     }
 
@@ -122,6 +156,11 @@ public sealed class RollingAggregator
         bool isFinal,
         IReadOnlyList<string> generatedFiles)
     {
+        if (isFinal)
+        {
+            FlushAllActiveIncidents();
+        }
+
         var appPoolSummaries = _appPools.Values
             .OrderByDescending(p => p.MaxHungRequests)
             .ThenByDescending(p => p.MaxPooledConnections)
@@ -137,12 +176,23 @@ public sealed class RollingAggregator
             .Select(n => n.ToSummary())
             .ToList();
 
-        var topIncidents = _incidents
+        IEnumerable<IncidentAccumulator> allIncidents = isFinal
+            ? _incidents
+            : _incidents.Concat(_activeIncidents.Values);
+
+        var topIncidents = allIncidents
             .OrderByDescending(i => SeverityRank(i.MaxSeverity))
             .ThenByDescending(i => i.AnomalyCount)
             .ThenByDescending(i => (i.EndUtc - i.StartUtc).TotalSeconds)
             .Take(20)
             .Select(i => i.ToSummary())
+            .ToList();
+
+        var topEventSignatures = _eventSignatures.Values
+            .OrderByDescending(e => e.Count)
+            .ThenByDescending(e => e.LastSeenUtc)
+            .Take(20)
+            .Select(e => e.ToSummary())
             .ToList();
 
         var hypotheses = RankRootCauseHypotheses(appPoolSummaries, nodeSummaries);
@@ -165,7 +215,8 @@ public sealed class RollingAggregator
             AppPools: appPoolSummaries,
             NodeJobs: nodeSummaries,
             TopIncidents: topIncidents,
-            GeneratedFiles: generatedFiles);
+            GeneratedFiles: generatedFiles,
+            TopEventLogSignatures: topEventSignatures);
     }
 
     private List<RootCauseHypothesis> RankRootCauseHypotheses(
@@ -236,8 +287,10 @@ public sealed class RollingAggregator
             int score = 0;
             var ev = new List<string>();
             int aspQ = GetCount("ASPNET_QUEUE_BUILDUP");
+            int aspRej = GetCount("ASPNET_REQUESTS_REJECTED");
             int httpQ = GetCount("HTTP_QUEUE_BUILDUP");
             if (aspQ > 0) { score += 25; ev.Add($"{aspQ} ASP.NET global queue buildup event(s)."); }
+            if (aspRej > 0) { score += 35; ev.Add($"{aspRej} ASP.NET request rejection event(s) (503 / queue overflow)."); }
             if (httpQ > 0) { score += 25; ev.Add($"{httpQ} HTTP.sys request queue buildup event(s)."); }
             if (score > 0)
             {
@@ -245,34 +298,46 @@ public sealed class RollingAggregator
             }
         }
 
-        // 5. Zombie Node.js Jobs Holding DB Connections
+        // 5. Zombie Node.js Jobs Holding DB Connections (low score when no DB sockets are held)
         {
             int score = 0;
             var ev = new List<string>();
             int zombieEvents = GetCount("NODE_ZOMBIE_JOB");
-            int maxNodeDb = nodeJobs.Count > 0 ? nodeJobs.Max(n => n.MaxDbEstablishedSockets + n.MaxDbCloseWaitSockets) : 0;
+            int maxNodeDb = nodeJobs
+                .Where(n => n.ZombieDetections > 0)
+                .Select(n => n.MaxDbEstablishedSockets + n.MaxDbCloseWaitSockets)
+                .DefaultIfEmpty(0)
+                .Max();
             if (zombieEvents > 0)
             {
-                score += 20 + (maxNodeDb > 0 ? 25 : 0);
-                ev.Add($"{zombieEvents} long-running/zombie Node.js job detection(s); peak DB sockets held by Node={maxNodeDb}.");
-            }
-            if (score > 0)
-            {
-                candidates.Add((score, "Zombie / Long-Running Node.js Jobs Holding DB Connections", ev));
+                if (maxNodeDb > 0)
+                {
+                    score += 45;
+                    ev.Add($"{zombieEvents} long-running/zombie Node.js job detection(s); peak DB sockets held by Node={maxNodeDb}.");
+                    candidates.Add((score, "Zombie / Long-Running Node.js Jobs Holding DB Connections", ev));
+                }
+                else
+                {
+                    score += 5;
+                    ev.Add($"{zombieEvents} long-running/idle Node.js process detection(s) with 0 DB sockets (likely persistent daemon; configure --node-ignore if expected).");
+                    candidates.Add((score, "Long-Running / Idle Node.js Processes (No DB Sockets)", ev));
+                }
             }
         }
 
-        // 6. CLR Thread Contention / Exception Storm
+        // 6. CLR Thread Contention / GC Pressure / Exception Storm
         {
             int score = 0;
             var ev = new List<string>();
             int contention = GetCount("THREAD_CONTENTION");
+            int highGc = GetCount("HIGH_GC_TIME");
             int exStorm = GetCount("EXCEPTION_STORM");
             if (contention > 0) { score += 25; ev.Add($"{contention} CLR lock/thread contention event(s)."); }
+            if (highGc > 0) { score += 25; ev.Add($"{highGc} CLR high GC time event(s) indicating memory pressure or GC pauses."); }
             if (exStorm > 0) { score += 15; ev.Add($"{exStorm} CLR exception storm event(s)."); }
             if (score > 0)
             {
-                candidates.Add((score, "CLR ThreadPool / Lock Contention or Exception Storm", ev));
+                candidates.Add((score, "CLR ThreadPool / Lock Contention, GC Pressure, or Exception Storm", ev));
             }
         }
 
@@ -310,34 +375,130 @@ public sealed class RollingAggregator
             .ToList();
     }
 
-    private void ClusterAnomaliesIntoIncident(TelemetrySnapshot snapshot, IReadOnlyList<AnomalyEvent> anomalies)
+    private TimeSpan GetEffectiveIncidentMergeGap()
     {
-        var gap = TimeSpan.FromSeconds(Math.Max(1, _config.Thresholds.IncidentMergeGapSeconds));
-        var ts = snapshot.TimestampUtc;
+        int baseGap = Math.Max(1, _config.Thresholds.IncidentMergeGapSeconds);
+        int effectiveSeconds = _config.AnomalyCooldownSeconds > 0
+            ? Math.Max(baseGap, _config.AnomalyCooldownSeconds + (_config.SampleIntervalSeconds * 2))
+            : baseGap;
+        return TimeSpan.FromSeconds(effectiveSeconds);
+    }
 
-        if (_activeIncident is null || (ts - _activeIncident.EndUtc) > gap)
+    private void CloseExpiredActiveIncidents(DateTimeOffset nowUtc)
+    {
+        if (_activeIncidents.Count == 0) return;
+
+        var gap = GetEffectiveIncidentMergeGap();
+        var expiredScopes = _activeIncidents
+            .Where(kv => (nowUtc - kv.Value.EndUtc) > gap)
+            .Select(kv => kv.Key)
+            .ToList();
+
+        foreach (string scope in expiredScopes)
         {
-            _activeIncident = new IncidentAccumulator(_nextIncidentId++, ts);
-            _incidents.Add(_activeIncident);
-
-            if (_incidents.Count > MaxStoredIncidents)
+            if (_activeIncidents.Remove(scope, out var closed))
             {
-                // Drop lowest-severity oldest incident to guarantee bounded memory.
-                var toRemove = _incidents
-                    .Where(i => i != _activeIncident)
-                    .OrderBy(i => SeverityRank(i.MaxSeverity))
-                    .ThenBy(i => i.AnomalyCount)
-                    .ThenBy(i => i.StartUtc)
-                    .FirstOrDefault();
-
-                if (toRemove is not null)
-                {
-                    _incidents.Remove(toRemove);
-                }
+                StoreClosedIncident(closed);
             }
         }
+    }
 
-        _activeIncident.Add(ts, anomalies, snapshot);
+    private void FlushAllActiveIncidents()
+    {
+        if (_activeIncidents.Count == 0) return;
+
+        foreach (var inc in _activeIncidents.Values)
+        {
+            StoreClosedIncident(inc);
+        }
+        _activeIncidents.Clear();
+    }
+
+    private void StoreClosedIncident(IncidentAccumulator incident)
+    {
+        _incidents.Add(incident);
+        if (_incidents.Count > MaxStoredIncidents)
+        {
+            // Drop lowest-severity oldest incident to guarantee bounded memory.
+            var toRemove = _incidents
+                .OrderBy(i => SeverityRank(i.MaxSeverity))
+                .ThenBy(i => i.AnomalyCount)
+                .ThenBy(i => i.StartUtc)
+                .FirstOrDefault();
+
+            if (toRemove is not null)
+            {
+                _incidents.Remove(toRemove);
+            }
+        }
+    }
+
+    private void ClusterAnomaliesIntoIncidents(TelemetrySnapshot snapshot, IReadOnlyList<AnomalyEvent> anomalies)
+    {
+        var gap = GetEffectiveIncidentMergeGap();
+        var ts = snapshot.TimestampUtc;
+
+        foreach (var group in anomalies.GroupBy(GetIncidentScope, StringComparer.OrdinalIgnoreCase))
+        {
+            string scope = group.Key;
+            bool isNodeScope = scope.StartsWith("NODE:", StringComparison.OrdinalIgnoreCase);
+
+            if (!_activeIncidents.TryGetValue(scope, out var active) || (ts - active.EndUtc) > gap)
+            {
+                if (active is not null)
+                {
+                    StoreClosedIncident(active);
+                }
+
+                active = new IncidentAccumulator(_nextIncidentId++, ts);
+                _activeIncidents[scope] = active;
+            }
+
+            active.Add(ts, group.ToList(), snapshot, includeIisContext: !isNodeScope);
+        }
+    }
+
+    private static string GetIncidentScope(AnomalyEvent anomaly)
+    {
+        if (anomaly.Code == "NODE_ZOMBIE_JOB" ||
+            string.Equals(anomaly.TargetType, "NodeJob", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"NODE:{anomaly.TargetName}";
+        }
+
+        return "IIS_DB_CLR";
+    }
+
+    private void RecordEventSignatures(IReadOnlyList<EventLogFinding> events)
+    {
+        foreach (var ev in events)
+        {
+            string sig = WindowsEventLogCollector.ExtractHighSignalSnippet(ev.Source, ev.EventId, ev.Message, 160);
+            var key = (ev.Source, ev.EventId, sig);
+
+            if (_eventSignatures.TryGetValue(key, out var acc))
+            {
+                acc.Record(ev.TimestampUtc);
+            }
+            else
+            {
+                if (_eventSignatures.Count >= MaxEventSignatures)
+                {
+                    var toEvict = _eventSignatures
+                        .OrderBy(kv => kv.Value.Count)
+                        .ThenBy(kv => kv.Value.LastSeenUtc)
+                        .Select(kv => kv.Key)
+                        .FirstOrDefault();
+
+                    if (toEvict != default)
+                    {
+                        _eventSignatures.Remove(toEvict);
+                    }
+                }
+
+                _eventSignatures[key] = new EventLogSignatureAccumulator(ev.Source, ev.EventId, ev.Level, sig, ev.TimestampUtc);
+            }
+        }
     }
 
     private AppPoolAccumulator GetOrCreateAppPool(string name)
@@ -377,6 +538,20 @@ public sealed class RollingAggregator
         private readonly HashSet<int> _seenPids = [];
         private readonly Dictionary<string, int> _hungUrlCounts = new(StringComparer.OrdinalIgnoreCase);
 
+        private double? _startWorkingSetMb;
+        private double _workingSetSumMb;
+        private int _workingSetCount;
+        private double? _endWorkingSetMb;
+
+        private double _cpuPercentSum;
+        private int _cpuPercentCount;
+        private double? _maxCpuPercent;
+
+        private double? _maxGcPercent;
+        private double? _maxGen2HeapMb;
+        private double? _maxTotalHeapMb;
+        private double? _maxLogicalThreads;
+
         public string AppPoolName { get; } = appPoolName;
         public int SamplesObserved { get; private set; }
         public int? LastKnownPid { get; private set; }
@@ -397,9 +572,25 @@ public sealed class RollingAggregator
             LastKnownPid = w.Pid;
             _seenPids.Add(w.Pid);
 
-            if (w.WorkingSetMb.HasValue && w.WorkingSetMb.Value > MaxWorkingSetMb)
+            if (w.WorkingSetMb.HasValue)
             {
-                MaxWorkingSetMb = w.WorkingSetMb.Value;
+                double mem = w.WorkingSetMb.Value;
+                _startWorkingSetMb ??= mem;
+                _workingSetSumMb += mem;
+                _workingSetCount++;
+                _endWorkingSetMb = mem;
+                if (mem > MaxWorkingSetMb)
+                {
+                    MaxWorkingSetMb = mem;
+                }
+            }
+
+            if (w.CpuPercent.HasValue)
+            {
+                double cpu = w.CpuPercent.Value;
+                _cpuPercentSum += cpu;
+                _cpuPercentCount++;
+                _maxCpuPercent = _maxCpuPercent.HasValue ? Math.Max(_maxCpuPercent.Value, cpu) : cpu;
             }
 
             if (tcp is not null)
@@ -454,6 +645,37 @@ public sealed class RollingAggregator
             if (queueSize > MaxHttpQueueSize) MaxHttpQueueSize = queueSize;
         }
 
+        public void RecordClr(ClrProcessMetrics clr)
+        {
+            if (clr.PercentTimeInGc.HasValue)
+            {
+                _maxGcPercent = _maxGcPercent.HasValue
+                    ? Math.Max(_maxGcPercent.Value, clr.PercentTimeInGc.Value)
+                    : clr.PercentTimeInGc.Value;
+            }
+
+            if (clr.Gen2HeapSizeMb.HasValue)
+            {
+                _maxGen2HeapMb = _maxGen2HeapMb.HasValue
+                    ? Math.Max(_maxGen2HeapMb.Value, clr.Gen2HeapSizeMb.Value)
+                    : clr.Gen2HeapSizeMb.Value;
+            }
+
+            if (clr.TotalHeapSizeMb.HasValue)
+            {
+                _maxTotalHeapMb = _maxTotalHeapMb.HasValue
+                    ? Math.Max(_maxTotalHeapMb.Value, clr.TotalHeapSizeMb.Value)
+                    : clr.TotalHeapSizeMb.Value;
+            }
+
+            if (clr.LogicalThreads.HasValue)
+            {
+                _maxLogicalThreads = _maxLogicalThreads.HasValue
+                    ? Math.Max(_maxLogicalThreads.Value, clr.LogicalThreads.Value)
+                    : clr.LogicalThreads.Value;
+            }
+        }
+
         public AppPoolHealthSummary ToSummary() => new(
             AppPoolName: AppPoolName,
             SamplesObserved: SamplesObserved,
@@ -473,7 +695,16 @@ public sealed class RollingAggregator
                 .OrderByDescending(kv => kv.Value)
                 .Take(5)
                 .Select(kv => $"{kv.Key} (x{kv.Value})")
-                .ToList());
+                .ToList(),
+            StartWorkingSetMb: _startWorkingSetMb.HasValue ? Math.Round(_startWorkingSetMb.Value, 1) : null,
+            AvgWorkingSetMb: _workingSetCount > 0 ? Math.Round(_workingSetSumMb / _workingSetCount, 1) : null,
+            EndWorkingSetMb: _endWorkingSetMb.HasValue ? Math.Round(_endWorkingSetMb.Value, 1) : null,
+            AvgCpuPercent: _cpuPercentCount > 0 ? Math.Round(_cpuPercentSum / _cpuPercentCount, 1) : null,
+            MaxCpuPercent: _maxCpuPercent.HasValue ? Math.Round(_maxCpuPercent.Value, 1) : null,
+            MaxGcPercent: _maxGcPercent.HasValue ? Math.Round(_maxGcPercent.Value, 1) : null,
+            MaxGen2HeapMb: _maxGen2HeapMb.HasValue ? Math.Round(_maxGen2HeapMb.Value, 1) : null,
+            MaxTotalHeapMb: _maxTotalHeapMb.HasValue ? Math.Round(_maxTotalHeapMb.Value, 1) : null,
+            MaxLogicalThreads: _maxLogicalThreads.HasValue ? Math.Round(_maxLogicalThreads.Value, 1) : null);
     }
 
     private sealed class NodeJobAccumulator(string jobLabel, string sampleCommandLine)
@@ -532,7 +763,7 @@ public sealed class RollingAggregator
         public string MaxSeverity { get; private set; } = nameof(AnomalySeverity.MEDIUM);
         public int AnomalyCount { get; private set; }
 
-        public void Add(DateTimeOffset ts, IReadOnlyList<AnomalyEvent> anomalies, TelemetrySnapshot snapshot)
+        public void Add(DateTimeOffset ts, IReadOnlyList<AnomalyEvent> anomalies, TelemetrySnapshot snapshot, bool includeIisContext)
         {
             if (ts > EndUtc) EndUtc = ts;
 
@@ -544,20 +775,24 @@ public sealed class RollingAggregator
                 if (SeverityRank(a.Severity) > SeverityRank(MaxSeverity)) MaxSeverity = a.Severity;
             }
 
-            foreach (var w in snapshot.Iis.Workers)
+            if (includeIisContext)
             {
-                foreach (var req in w.ActiveRequests.OrderByDescending(r => r.TimeElapsedMs).Take(3))
+                foreach (var w in snapshot.Iis.Workers)
                 {
-                    if (_hungUrls.Count >= 5) break;
-                    _hungUrls.Add($"{w.AppPoolName} {req.Verb} {req.Url} ({req.TimeElapsedMs}ms)");
+                    foreach (var req in w.ActiveRequests.OrderByDescending(r => r.TimeElapsedMs).Take(3))
+                    {
+                        if (_hungUrls.Count >= 5) break;
+                        _hungUrls.Add($"{w.AppPoolName} {req.Verb} {req.Url} ({req.TimeElapsedMs}ms)");
+                    }
                 }
-            }
 
-            foreach (var ev in snapshot.NewEvents)
-            {
-                if (_eventSnippets.Count >= 5) break;
-                string snippet = $"[{ev.Source}#{ev.EventId}] {(ev.Message.Length <= 140 ? ev.Message : ev.Message[..140] + "...")}";
-                _eventSnippets.Add(snippet);
+                foreach (var ev in snapshot.NewEvents)
+                {
+                    if (_eventSnippets.Count >= 5) break;
+                    string highSignal = WindowsEventLogCollector.ExtractHighSignalSnippet(ev.Source, ev.EventId, ev.Message, 160);
+                    string snippet = $"[{ev.Source}#{ev.EventId}] {highSignal}";
+                    _eventSnippets.Add(snippet);
+                }
             }
         }
 
@@ -572,5 +807,37 @@ public sealed class RollingAggregator
             Targets: _targets.OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList(),
             SampleHungUrls: _hungUrls.ToList(),
             CorrelatedEventSnippets: _eventSnippets.ToList());
+    }
+
+    private sealed class EventLogSignatureAccumulator(
+        string source,
+        int eventId,
+        string level,
+        string signature,
+        DateTimeOffset firstSeenUtc)
+    {
+        public string Source { get; } = source;
+        public int EventId { get; } = eventId;
+        public string Level { get; } = level;
+        public string Signature { get; } = signature;
+        public int Count { get; private set; } = 1;
+        public DateTimeOffset FirstSeenUtc { get; private set; } = firstSeenUtc;
+        public DateTimeOffset LastSeenUtc { get; private set; } = firstSeenUtc;
+
+        public void Record(DateTimeOffset ts)
+        {
+            Count++;
+            if (ts < FirstSeenUtc) FirstSeenUtc = ts;
+            if (ts > LastSeenUtc) LastSeenUtc = ts;
+        }
+
+        public EventLogSignatureSummary ToSummary() => new(
+            Source: Source,
+            EventId: EventId,
+            Level: Level,
+            Signature: Signature,
+            Count: Count,
+            FirstSeenUtc: FirstSeenUtc,
+            LastSeenUtc: LastSeenUtc);
     }
 }

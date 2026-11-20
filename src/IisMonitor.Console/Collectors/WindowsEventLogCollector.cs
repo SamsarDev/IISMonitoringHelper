@@ -1,11 +1,22 @@
 using System.Diagnostics.Eventing.Reader;
+using System.Text.RegularExpressions;
 using IisMonitor.Abstractions;
 using IisMonitor.Domain;
 
 namespace IisMonitor.Collectors;
 
-public sealed class WindowsEventLogCollector : IWindowsEventLogCollector
+public sealed partial class WindowsEventLogCollector : IWindowsEventLogCollector
 {
+    public const int MaxStoredMessageLength = 4000;
+
+    [GeneratedRegex(@"Exception type:\s*(?<val>.+?)(?=\s+Exception message:|\s+Request information:|\s+Thread information:|\r|\n|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
+    private static partial Regex ExceptionTypeRegex();
+
+    [GeneratedRegex(@"Exception message:\s*(?<val>.+?)(?=\s+at\s+\S+|\s+Request information:|\s+Thread information:|\s+Custom event details:|\r|\n|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
+    private static partial Regex ExceptionMessageRegex();
+
+    [GeneratedRegex(@"Request URL:\s*(?<val>\S+)", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
+    private static partial Regex RequestUrlRegex();
     private static readonly string[] TargetLogs = ["Application", "System"];
 
     private static readonly string[] RelevantSourcePrefixes =
@@ -75,8 +86,7 @@ public sealed class WindowsEventLogCollector : IWindowsEventLogCollector
         DateTimeOffset cursorTime = _lastTimestampByLog[logName];
         long lastRecordId = _lastRecordIdByLog.TryGetValue(logName, out long rid) ? rid : -1;
 
-        string isoTime = cursorTime.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
-        string xpath = $"*[System[(Level=1 or Level=2 or Level=3) and TimeCreated[@SystemTime>='{isoTime}']]]";
+        string xpath = BuildXPathQuery(lastRecordId, cursorTime);
 
         var query = new EventLogQuery(logName, PathType.LogName, xpath);
         using var reader = new EventLogReader(query);
@@ -134,7 +144,7 @@ public sealed class WindowsEventLogCollector : IWindowsEventLogCollector
                     EventId: eventId,
                     Level: level,
                     Source: source,
-                    Message: CompactMessage(message, 1000),
+                    Message: CompactMessage(message, MaxStoredMessageLength),
                     IsSqlPoolTimeout: isSqlPoolTimeout,
                     IsWasRecycleOrCrash: isWasRecycle));
             }
@@ -144,7 +154,100 @@ public sealed class WindowsEventLogCollector : IWindowsEventLogCollector
         {
             _lastRecordIdByLog[logName] = maxRecordIdSeen;
         }
+        else if (lastRecordId >= 0 && readCount == 0)
+        {
+            DetectLogClearedAndResetCursor(logName, lastRecordId);
+        }
         _lastTimestampByLog[logName] = maxTimeSeen;
+    }
+
+    private void DetectLogClearedAndResetCursor(string logName, long lastRecordId)
+    {
+        try
+        {
+            var reverseQuery = new EventLogQuery(logName, PathType.LogName, "*")
+            {
+                ReverseDirection = true
+            };
+            using var reverseReader = new EventLogReader(reverseQuery);
+            using var latest = reverseReader.ReadEvent();
+            if (latest is null || (latest.RecordId.HasValue && latest.RecordId.Value < lastRecordId))
+            {
+                _lastRecordIdByLog.Remove(logName);
+            }
+        }
+        catch
+        {
+            // Ignore permission or transient EventLog errors during clear detection.
+        }
+    }
+
+    public static string BuildXPathQuery(long lastRecordId, DateTimeOffset cursorTime)
+    {
+        if (lastRecordId >= 0)
+        {
+            return $"*[System[(Level=1 or Level=2 or Level=3) and EventRecordID>{lastRecordId}]]";
+        }
+
+        string isoTime = cursorTime.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+        return $"*[System[(Level=1 or Level=2 or Level=3) and TimeCreated[@SystemTime>='{isoTime}']]]";
+    }
+
+    public static string ExtractHighSignalSnippet(string source, int eventId, string message, int maxLength = 220)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return string.Empty;
+        }
+
+        string normalized = message.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ').Trim();
+
+        var parts = new List<string>(3);
+
+        var exTypeMatch = ExceptionTypeRegex().Match(normalized);
+        if (exTypeMatch.Success)
+        {
+            string val = exTypeMatch.Groups["val"].Value.Trim();
+            if (!string.IsNullOrEmpty(val))
+            {
+                parts.Add($"ExType={val}");
+            }
+        }
+
+        var exMsgMatch = ExceptionMessageRegex().Match(normalized);
+        if (exMsgMatch.Success)
+        {
+            string val = exMsgMatch.Groups["val"].Value.Trim();
+            if (!string.IsNullOrEmpty(val))
+            {
+                if (val.Length > 140) val = val[..140] + "...";
+                parts.Add($"ExMsg={val}");
+            }
+        }
+
+        var urlMatch = RequestUrlRegex().Match(normalized);
+        if (urlMatch.Success)
+        {
+            string val = urlMatch.Groups["val"].Value.Trim();
+            int queryIdx = val.IndexOf('?');
+            if (queryIdx >= 0)
+            {
+                val = val[..queryIdx];
+            }
+            if (!string.IsNullOrEmpty(val))
+            {
+                if (val.Length > 100) val = val[..100] + "...";
+                parts.Add($"Url={val}");
+            }
+        }
+
+        if (parts.Count > 0)
+        {
+            string combined = string.Join(" | ", parts);
+            return combined.Length <= maxLength ? combined : combined[..maxLength] + "...";
+        }
+
+        return normalized.Length <= maxLength ? normalized : normalized[..maxLength] + "...";
     }
 
     public static bool IsRelevantSource(string source) =>

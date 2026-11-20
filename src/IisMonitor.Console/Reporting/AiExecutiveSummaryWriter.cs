@@ -96,15 +96,18 @@ public sealed class AiExecutiveSummaryWriter : IExecutiveSummaryWriter
         else
         {
             sb.AppendLine(string.Format(inv,
-                "{0,-26} {1,6} {2,4} {3,7} {4,9} {5,7} {6,7} {7,6} {8,8} {9,6} {10,8}",
-                "AppPool", "PIDs", "Rec", "MaxPool", "Reclaim+", "DbEstab", "DbClWt", "Hung#", "MaxReqMs", "HttpQ", "MaxMemMB"));
-            sb.AppendLine(new string('-', 106));
+                "{0,-26} {1,5} {2,4} {3,7} {4,8} {5,7} {6,6} {7,5} {8,8} {9,5} {10,7} {11,7} {12,8}",
+                "AppPool", "PIDs", "Rec", "MaxPool", "Reclaim+", "DbEstab", "DbClWt", "Hung#", "MaxReqMs", "HttpQ", "AvgCpu%", "MaxCpu%", "MaxMemMB"));
+            sb.AppendLine(new string('-', 114));
 
             foreach (var p in r.AppPools)
             {
                 string name = p.AppPoolName.Length <= 26 ? p.AppPoolName : p.AppPoolName[..23] + "...";
+                string avgCpu = p.AvgCpuPercent.HasValue ? p.AvgCpuPercent.Value.ToString("0.0", inv) : "n/a";
+                string maxCpu = p.MaxCpuPercent.HasValue ? p.MaxCpuPercent.Value.ToString("0.0", inv) : "n/a";
+
                 sb.AppendLine(string.Format(inv,
-                    "{0,-26} {1,6} {2,4} {3,7:0.#} {4,9:0.#} {5,7} {6,7} {7,6} {8,8} {9,6:0.#} {10,8:0.#}",
+                    "{0,-26} {1,5} {2,4} {3,7:0.#} {4,8:0.#} {5,7} {6,6} {7,5} {8,8} {9,5:0.#} {10,7} {11,7} {12,8:0.#}",
                     name,
                     p.DistinctPidCount,
                     p.RecycleCount,
@@ -115,7 +118,35 @@ public sealed class AiExecutiveSummaryWriter : IExecutiveSummaryWriter
                     p.MaxHungRequests,
                     p.MaxRequestElapsedMs,
                     p.MaxHttpQueueSize,
+                    avgCpu,
+                    maxCpu,
                     p.MaxWorkingSetMb));
+
+                bool hasMemTrend = p.StartWorkingSetMb.HasValue || p.AvgWorkingSetMb.HasValue || p.EndWorkingSetMb.HasValue;
+                bool hasClr = p.MaxGcPercent.HasValue || p.MaxGen2HeapMb.HasValue || p.MaxTotalHeapMb.HasValue || p.MaxLogicalThreads.HasValue;
+                if (hasMemTrend || hasClr)
+                {
+                    var detailParts = new List<string>(2);
+                    if (hasMemTrend)
+                    {
+                        detailParts.Add(string.Format(inv,
+                            "MemMB(start={0} avg={1} max={2:0.#} end={3})",
+                            p.StartWorkingSetMb?.ToString("0.#", inv) ?? "n/a",
+                            p.AvgWorkingSetMb?.ToString("0.#", inv) ?? "n/a",
+                            p.MaxWorkingSetMb,
+                            p.EndWorkingSetMb?.ToString("0.#", inv) ?? "n/a"));
+                    }
+                    if (hasClr)
+                    {
+                        detailParts.Add(string.Format(inv,
+                            "CLR(maxGC={0}% maxGen2={1}MB maxHeap={2}MB maxLogThr={3})",
+                            p.MaxGcPercent?.ToString("0.#", inv) ?? "n/a",
+                            p.MaxGen2HeapMb?.ToString("0.#", inv) ?? "n/a",
+                            p.MaxTotalHeapMb?.ToString("0.#", inv) ?? "n/a",
+                            p.MaxLogicalThreads?.ToString("0.#", inv) ?? "n/a"));
+                    }
+                    sb.AppendLine($"    {string.Join(" | ", detailParts)}");
+                }
 
                 if (p.TopHungUrls.Count > 0)
                 {
@@ -175,6 +206,22 @@ public sealed class AiExecutiveSummaryWriter : IExecutiveSummaryWriter
                 {
                     sb.AppendLine($"  Events:   {string.Join(" ; ", inc.CorrelatedEventSnippets)}");
                 }
+            }
+        }
+        sb.AppendLine();
+
+        sb.AppendLine("=== TOP_EVENTLOG_SIGNATURES ===");
+        if (r.TopEventLogSignatures is null || r.TopEventLogSignatures.Count == 0)
+        {
+            sb.AppendLine("No relevant EventLog warnings/errors recorded.");
+        }
+        else
+        {
+            foreach (var sig in r.TopEventLogSignatures)
+            {
+                sb.AppendLine(string.Format(inv,
+                    "  [x{0,-4}] [{1}] {2}#{3} ({4:yyyy-MM-ddTHH:mm:ssZ} .. {5:yyyy-MM-ddTHH:mm:ssZ}) | {6}",
+                    sig.Count, sig.Level, sig.Source, sig.EventId, sig.FirstSeenUtc, sig.LastSeenUtc, sig.Signature));
             }
         }
         sb.AppendLine();

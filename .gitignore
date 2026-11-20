@@ -21,3 +21,8 @@ secrets/
 # OS
 .DS_Store
 Thumbs.db
+
+# Published output and runtime telemetry dumps
+publish/
+monitor-output/
+**/monitor-output/

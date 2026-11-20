@@ -14,6 +14,7 @@ public sealed class AspNetAndClrCollector : IAspNetAndClrCollector
     private const string ClrMemoryCategory = ".NET CLR Memory";
 
     private readonly Dictionary<(string Category, string Counter, string Instance), PerformanceCounter> _cache = new();
+    private readonly ClrPidShiftTracker _pidTracker = new();
     private bool _disposed;
 
     public AspNetAndClrCollectionResult Collect(IReadOnlyDictionary<int, string> pidToAppPool)
@@ -148,30 +149,53 @@ public sealed class AspNetAndClrCollector : IAspNetAndClrCollector
 
             bool hasLocks = PerformanceCounterCategory.Exists(ClrLocksCategory);
             bool hasExceps = PerformanceCounterCategory.Exists(ClrExceptionsCategory);
+            var activeClrInstances = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (string instance in w3wpInstances)
             {
                 double? pidVal = ReadCounter(ClrMemoryCategory, "Process ID", instance, activeKeys);
                 int? pid = pidVal.HasValue ? (int)Math.Round(pidVal.Value) : null;
-                string? appPool = pid.HasValue && pidToAppPool.TryGetValue(pid.Value, out var ap) ? ap : null;
+                if (!pid.HasValue || pid.Value <= 0)
+                {
+                    continue;
+                }
+
+                activeClrInstances.Add(instance);
+                bool pidShifted = _pidTracker.Observe(instance, pid.Value);
+                if (pidShifted)
+                {
+                    InvalidateRateCounters(instance);
+                }
+
+                string? appPool = pidToAppPool.TryGetValue(pid.Value, out var ap) ? ap : null;
 
                 double? gen2Bytes = ReadCounter(ClrMemoryCategory, "Gen 2 heap size", instance, activeKeys);
                 double? totalBytes = ReadCounter(ClrMemoryCategory, "# Bytes in all Heaps", instance, activeKeys);
 
-                list.Add(new ClrProcessMetrics(
+                double? contentionRate = hasLocks ? ReadCounter(ClrLocksCategory, "Contention Rate / sec", instance, activeKeys) : null;
+                double? exceptionsRate = hasExceps ? ReadCounter(ClrExceptionsCategory, "# of Exceps Thrown / sec", instance, activeKeys) : null;
+                double? percentTimeInGc = ReadCounter(ClrMemoryCategory, "% Time in GC", instance, activeKeys);
+
+                var metrics = new ClrProcessMetrics(
                     InstanceName: instance,
                     Pid: pid,
                     AppPoolName: appPool,
-                    ContentionRatePerSec: hasLocks ? ReadCounter(ClrLocksCategory, "Contention Rate / sec", instance, activeKeys) : null,
+                    ContentionRatePerSec: contentionRate,
                     CurrentLockQueueLength: hasLocks ? ReadCounter(ClrLocksCategory, "Current Queue Length", instance, activeKeys) : null,
                     TotalContentions: hasLocks ? ReadCounter(ClrLocksCategory, "Total # of Contentions", instance, activeKeys) : null,
                     LogicalThreads: hasLocks ? ReadCounter(ClrLocksCategory, "# of current logical Threads", instance, activeKeys) : null,
                     PhysicalThreads: hasLocks ? ReadCounter(ClrLocksCategory, "# of current physical Threads", instance, activeKeys) : null,
-                    ExceptionsThrownPerSec: hasExceps ? ReadCounter(ClrExceptionsCategory, "# of Exceps Thrown / sec", instance, activeKeys) : null,
-                    PercentTimeInGc: ReadCounter(ClrMemoryCategory, "% Time in GC", instance, activeKeys),
+                    ExceptionsThrownPerSec: exceptionsRate,
+                    PercentTimeInGc: percentTimeInGc,
                     Gen2HeapSizeMb: gen2Bytes.HasValue ? Math.Round(gen2Bytes.Value / (1024.0 * 1024.0), 2) : null,
-                    TotalHeapSizeMb: totalBytes.HasValue ? Math.Round(totalBytes.Value / (1024.0 * 1024.0), 2) : null));
+                    TotalHeapSizeMb: totalBytes.HasValue ? Math.Round(totalBytes.Value / (1024.0 * 1024.0), 2) : null);
+
+                // Suppress cross-process rate counter spikes on the PID transition sample;
+                // the fresh counters above now hold the new process's baseline.
+                list.Add(ClrPidShiftTracker.ApplyPidShiftSuppression(metrics, pidShifted));
             }
+
+            _pidTracker.Prune(activeClrInstances);
         }
         catch (Exception ex)
         {
@@ -179,6 +203,21 @@ public sealed class AspNetAndClrCollector : IAspNetAndClrCollector
         }
 
         return list;
+    }
+
+    private void InvalidateRateCounters(string instance)
+    {
+        RemoveCachedCounter((ClrLocksCategory, "Contention Rate / sec", instance));
+        RemoveCachedCounter((ClrExceptionsCategory, "# of Exceps Thrown / sec", instance));
+        RemoveCachedCounter((ClrMemoryCategory, "% Time in GC", instance));
+    }
+
+    private void RemoveCachedCounter((string Category, string Counter, string Instance) key)
+    {
+        if (_cache.Remove(key, out var counter))
+        {
+            counter.Dispose();
+        }
     }
 
     private double? ReadCounter(
@@ -233,5 +272,45 @@ public sealed class AspNetAndClrCollector : IAspNetAndClrCollector
             counter.Dispose();
         }
         _cache.Clear();
+        _pidTracker.Clear();
     }
+}
+
+internal sealed class ClrPidShiftTracker
+{
+    private readonly Dictionary<string, int> _lastPidByInstance = new(StringComparer.OrdinalIgnoreCase);
+
+    public int TrackedCount => _lastPidByInstance.Count;
+
+    /// <summary>
+    /// Records the observed PID for a CLR performance counter instance name.
+    /// Returns true if the instance was previously bound to a different PID (w3wp#N index shift).
+    /// </summary>
+    public bool Observe(string instanceName, int pid)
+    {
+        bool shifted = _lastPidByInstance.TryGetValue(instanceName, out int prevPid) && prevPid != pid;
+        _lastPidByInstance[instanceName] = pid;
+        return shifted;
+    }
+
+    public static ClrProcessMetrics ApplyPidShiftSuppression(ClrProcessMetrics metrics, bool pidShifted) =>
+        pidShifted
+            ? metrics with
+            {
+                ContentionRatePerSec = metrics.ContentionRatePerSec.HasValue ? 0.0 : null,
+                ExceptionsThrownPerSec = metrics.ExceptionsThrownPerSec.HasValue ? 0.0 : null,
+                PercentTimeInGc = metrics.PercentTimeInGc.HasValue ? 0.0 : null
+            }
+            : metrics;
+
+    public void Prune(IReadOnlySet<string> activeInstances)
+    {
+        var stale = _lastPidByInstance.Keys.Where(k => !activeInstances.Contains(k)).ToList();
+        foreach (string key in stale)
+        {
+            _lastPidByInstance.Remove(key);
+        }
+    }
+
+    public void Clear() => _lastPidByInstance.Clear();
 }

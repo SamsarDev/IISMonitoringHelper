@@ -63,6 +63,7 @@ public sealed class MonitorRunner
 
         long sampleSeq = 0;
         var interval = TimeSpan.FromSeconds(_config.SampleIntervalSeconds);
+        ExecutiveSummaryReport finalReport;
 
         try
         {
@@ -127,13 +128,13 @@ public sealed class MonitorRunner
         }
         finally
         {
-            // Always flush final summary on completion or Ctrl+C / SIGTERM.
-            var finalReport = aggregator.BuildReport(_clock.UtcNow, isFinal: true, _telemetryWriter.GetGeneratedFiles());
+            // Always flush final summary on completion or Ctrl+C / SIGTERM (built once).
+            finalReport = aggregator.BuildReport(_clock.UtcNow, isFinal: true, _telemetryWriter.GetGeneratedFiles());
             await _summaryWriter.WriteSummaryAsync(finalReport, CancellationToken.None).ConfigureAwait(false);
             _log($"[{_clock.UtcNow:yyyy-MM-ddTHH:mm:ssZ}] Final executive summary written. Total samples={finalReport.TotalSamples}.");
         }
 
-        return aggregator.BuildReport(_clock.UtcNow, isFinal: true, _telemetryWriter.GetGeneratedFiles());
+        return finalReport;
     }
 
     private TelemetrySnapshot CollectSnapshotSafe(

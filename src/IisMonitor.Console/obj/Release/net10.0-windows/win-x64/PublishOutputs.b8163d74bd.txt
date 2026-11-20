@@ -1,3 +1,0 @@
-C:\Users\admin\Documents\Repos\th360\th360-iis-monitoreo\publish\win-x64\IisMonitor.pdb
-C:\Users\admin\Documents\Repos\th360\th360-iis-monitoreo\publish\win-x64\appsettings.json
-C:\Users\admin\Documents\Repos\th360\th360-iis-monitoreo\publish\win-x64\IisMonitor.exe

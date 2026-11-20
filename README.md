@@ -8,12 +8,12 @@ Cuando una aplicación IIS/.NET 4.5 se cuelga sin saturar CPU ni RAM, el cuello 
 
 | Capa | Qué recolecta | Qué problema detecta |
 |---|---|---|
-| **IIS (`Microsoft.Web.Administration` + fallback WMI)** | AppPools, PIDs de `w3wp.exe` y peticiones activas (`WorkerProcess.GetRequests(0)` con URL, verbo, módulo y tiempo transcurrido) | Peticiones colgadas (*hung requests*), bloqueos en el pipeline y reciclajes/caídas inesperadas de AppPools |
-| **ADO.NET SqlClient (PerfCounters)** | `.NET Data Provider for SqlServer`: `NumberOfPooledConnections`, `NumberOfReclaimedConnections`, `Hard/SoftConnectsPerSecond`, `NumberOfActiveConnections`, etc. | Agotamiento del pool de conexiones (límite por defecto = 100) y fugas de conexiones no cerradas reclamadas por el GC |
+| **IIS (`Microsoft.Web.Administration` + fallback WMI)** | AppPools, PIDs de `w3wp.exe`, % de CPU por proceso (`cpuPct`), memoria y peticiones activas (`WorkerProcess.GetRequests(0)` con URL, verbo, módulo y tiempo transcurrido) | Peticiones colgadas (*hung requests*), bloqueos en el pipeline, fugas de memoria y reciclajes/caídas inesperadas de AppPools |
+| **ADO.NET SqlClient (PerfCounters)** | `.NET Data Provider for SqlServer`: `NumberOfPooledConnections`, `NumberOfReclaimedConnections`, `Hard/SoftConnectsPerSecond`, `NumberOfActiveConnections`, etc. (solo instancias IIS en `APP_POOL_HEALTH_MATRIX`) | Agotamiento del pool de conexiones (límite por defecto = 100) y fugas de conexiones no cerradas reclamadas por el GC |
 | **Sockets TCP (`iphlpapi.dll` IPv4/IPv6)** | Tabla TCP por PID (`GetExtendedTcpTable`), filtrando puertos de base de datos (`1433` por defecto) y estados `ESTABLISHED`, `CLOSE_WAIT`, `TIME_WAIT` | Fugas de conexiones a BD (`CLOSE_WAIT`), saturación de sockets `ESTABLISHED` y *churn* en `TIME_WAIT` |
-| **ASP.NET / HTTP.sys / CLR (PerfCounters)** | Colas de peticiones (`ASP.NET v4.0.30319`, `HTTP Service Request Queues`), contención de hilos, excepciones/s y GC | Acumulación de cola, contención de ThreadPool/locks y tormentas de excepciones |
-| **Procesos Node.js (`node.exe` + WMI)** | PID, script/línea de comandos, uptime, RAM, delta de CPU y sockets TCP abiertos hacia BD | Jobs *zombie* o colgados reteniendo conexiones a la base de datos |
-| **Windows Event Log (`Application` y `System`)** | Lectura incremental de advertencias/errores de `ASP.NET`, `.NET Runtime`, `WAS`, `W3SVC`, `IIS`, `HTTP`, `SqlClient` | Timeouts del pool de SQL (`max pool size was reached`) y eventos de reciclaje/crash de WAS (`5002`, `5009`, `5011`, `5074-5080`, `5139`) |
+| **ASP.NET / HTTP.sys / CLR (PerfCounters)** | Colas globales y por aplicación (`ASP.NET v4.0.30319`, `ASP.NET Apps v4.0.30319`, `HTTP Service Request Queues`), contención de hilos, excepciones/s, % tiempo en GC y tamaños de heap Gen2/total (con protección ante desplazamiento de índices `w3wp#N`) | Acumulación de cola, rechazos de peticiones (`ASPNET_REQUESTS_REJECTED`), presión de GC (`HIGH_GC_TIME`), contención de ThreadPool/locks y tormentas de excepciones |
+| **Procesos Node.js (`node.exe` + WMI)** | PID, script/línea de comandos, uptime, RAM, delta de CPU y sockets TCP abiertos hacia BD (con soporte opcional para ignorar daemons persistentes mediante `--node-ignore`) | Jobs *zombie* o colgados reteniendo conexiones a la base de datos |
+| **Windows Event Log (`Application` y `System`)** | Lectura incremental por cursor `EventRecordID` (con detección de limpieza de log), mensajes de hasta 4.000 caracteres y extracción de `Exception type`, `Exception message` y `Request URL` en eventos ASP.NET | Timeouts del pool de SQL (`max pool size was reached`), excepciones repetitivas de ASP.NET agrupadas y eventos de reciclaje/crash de WAS (`5002`, `5009`, `5011`, `5074-5080`, `5139`) |
 
 ## Prerrequisitos
 
@@ -55,6 +55,8 @@ Todos los umbrales y parámetros se configuran en `appsettings.json` y pueden so
 | `--output <ruta>` | Carpeta de salida de reportes | `./monitor-output` |
 | `--db-ports <p1,p2>` | Puertos TCP de base de datos a vigilar | `1433` |
 | `--app-pools <a1,a2>` | Filtro opcional de AppPools (vacío = todos) | todos |
+| `--anomaly-cooldown-seconds <n>` | Cooldown por `(Code, Target)` para anomalías sostenidas (permite escalación inmediata de severidad y excluye eventos discretos/delta como reciclajes, rechazos o timeouts) | `300` |
+| `--node-ignore <p1,p2>` | Subcadenas separadas por coma para excluir daemons persistentes de Node.js de alertas `NODE_ZOMBIE_JOB` | vacío |
 | `--once` | Toma una única muestra y finaliza | `false` |
 
 ## Ejecución durante 3 días (72 horas)
@@ -101,9 +103,9 @@ Si desea habilitar `NumberOfActiveConnections` (requiere reciclar los AppPools o
 
 La carpeta de salida contendrá únicamente archivos de texto plano estructurados:
 
-1. `00_AI_EXECUTIVE_SUMMARY.txt` — **Empiece aquí.** Resumen ejecutivo compacto (actualizado cada hora y al finalizar) con hipótesis de causa raíz ordenadas por evidencia, matriz de salud por AppPool, resumen de jobs Node.js y top 20 ventanas de incidentes con timestamps UTC.
-2. `01_INCIDENTS_AND_ANOMALIES.jsonl` — Flujo cronológico de anomalías detectadas (una línea JSON por evento).
-3. `02_TIMELINE_METRICS_YYYY-MM-DD.jsonl` — Métricas detalladas rotadas diariamente en UTC.
-4. `03_EVENTLOG_FINDINGS.jsonl` — Advertencias y errores filtrados de Windows Event Log.
+1. `00_AI_EXECUTIVE_SUMMARY.txt` — **Empiece aquí.** Resumen ejecutivo compacto (actualizado cada hora y al finalizar) con hipótesis de causa raíz ordenadas por evidencia, matriz de salud por AppPool (`APP_POOL_HEALTH_MATRIX` con CPU promedio/máximo, tendencia de memoria `Start/Avg/Max/End` y métricas CLR de GC/Heap/hilos), resumen de jobs Node.js, top 20 ventanas de incidentes segmentadas por ámbito (Node.js separado de IIS/BD/CLR) y `TOP_EVENTLOG_SIGNATURES` con firmas de eventos agrupadas por frecuencia.
+2. `01_INCIDENTS_AND_ANOMALIES.jsonl` — Flujo cronológico de anomalías detectadas (una línea JSON por evento), incluyendo reglas de `ASPNET_REQUESTS_REJECTED` y `HIGH_GC_TIME`, deduplicación por cooldown con escalación inmediata de severidad y emisión sin cooldown para eventos discretos/delta (`APPPOOL_RECYCLE_OR_CRASH`, `DB_POOL_TIMEOUT_EVENT`, `ASPNET_REQUESTS_REJECTED`, `CONNECTION_LEAK_RECLAIMED`).
+3. `02_TIMELINE_METRICS_YYYY-MM-DD.jsonl` — Métricas detalladas rotadas diariamente en UTC, incluyendo `cpuPct` por worker `w3wp.exe` y contadores activos de `aspNetApps`.
+4. `03_EVENTLOG_FINDINGS.jsonl` — Advertencias y errores filtrados de Windows Event Log (hasta 4.000 caracteres por mensaje, leídos incrementalmente por `EventRecordID`).
 
 **Flujo recomendado para agentes de IA:** entregue primero `00_AI_EXECUTIVE_SUMMARY.txt` al agente; a partir de las ventanas de incidentes (`[INC-001] ...`) y sus timestamps UTC, el agente puede inspeccionar líneas específicas en `01_INCIDENTS_AND_ANOMALIES.jsonl`, `02_TIMELINE_METRICS_*.jsonl` y `03_EVENTLOG_FINDINGS.jsonl` sin saturar su ventana de contexto.

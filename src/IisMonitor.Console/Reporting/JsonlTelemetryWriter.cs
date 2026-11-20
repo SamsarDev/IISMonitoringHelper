@@ -88,6 +88,7 @@ public sealed class JsonlTelemetryWriter : ITelemetryWriter
                 pid = w.Pid,
                 appPool = w.AppPoolName,
                 wsMb = w.WorkingSetMb,
+                cpuPct = w.CpuPercent,
                 threads = w.ThreadCount,
                 handles = w.HandleCount,
                 activeReqs = w.ActiveRequests.Count,
@@ -137,6 +138,16 @@ public sealed class JsonlTelemetryWriter : ITelemetryWriter
             .Where(q => (q.CurrentQueueSize ?? 0) > 0 || (q.RejectedRequests ?? 0) > 0 || (q.ArrivalRate ?? 0) > 0)
             .ToList();
 
+        var activeAspNetApps = s.AspNetAndClr.AspNetApps
+            .Where(a => (a.RequestsExecuting ?? 0) > 0
+                     || (a.RequestsInApplicationQueue ?? 0) > 0
+                     || (a.RequestsTimedOut ?? 0) > 0
+                     || (a.RequestsFailed ?? 0) > 0)
+            .OrderByDescending(a => (a.RequestsExecuting ?? 0) + (a.RequestsInApplicationQueue ?? 0))
+            .ThenByDescending(a => (a.RequestsTimedOut ?? 0) + (a.RequestsFailed ?? 0))
+            .Take(10)
+            .ToList();
+
         return new
         {
             ts = s.TimestampUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"),
@@ -145,6 +156,7 @@ public sealed class JsonlTelemetryWriter : ITelemetryWriter
             workers,
             adoNet = adoNet.Count > 0 ? adoNet : null,
             aspNetGlobal = s.AspNetAndClr.AspNetGlobal,
+            aspNetApps = activeAspNetApps.Count > 0 ? activeAspNetApps : null,
             httpQueues = nonZeroQueues.Count > 0 ? nonZeroQueues : null,
             clr = s.AspNetAndClr.ClrProcesses.Count > 0 ? s.AspNetAndClr.ClrProcesses : null,
             tcpSystem = new

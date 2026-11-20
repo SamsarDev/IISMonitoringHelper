@@ -11,26 +11,70 @@ public sealed partial class IisWorkerProcessCollector : IIisWorkerProcessCollect
 {
     private const int MaxRequestsPerWorker = 100;
 
+    private readonly Dictionary<int, (double TotalCpuMs, DateTimeOffset SampleUtc)> _prevCpuByPid = new();
+
     [GeneratedRegex(@"(?i)-ap\s+""([^""]+)""|(?i)-ap\s+(\S+)", RegexOptions.Compiled)]
     private static partial Regex AppPoolArgRegex();
 
     public IisCollectionResult Collect(IReadOnlySet<string> appPoolFilter)
     {
         var warnings = new List<string>();
+        var sampleUtc = DateTimeOffset.UtcNow;
 
+        IisCollectionResult result;
         try
         {
-            return CollectViaServerManager(appPoolFilter, warnings);
+            result = CollectViaServerManager(appPoolFilter, sampleUtc, warnings);
         }
         catch (Exception ex)
         {
             warnings.Add($"IIS ServerManager unavailable ({ex.GetType().Name}: {ex.Message}). Falling back to WMI w3wp.exe discovery.");
-            return CollectViaWmiFallback(appPoolFilter, warnings);
+            result = CollectViaWmiFallback(appPoolFilter, sampleUtc, warnings);
+        }
+
+        PruneExitedPids(result.Workers.Select(w => w.Pid).ToHashSet());
+        return result;
+    }
+
+    internal double? ComputeCpuPercent(int pid, double? totalProcessorTimeMs, DateTimeOffset sampleUtc, int processorCount)
+    {
+        if (!totalProcessorTimeMs.HasValue)
+        {
+            return null;
+        }
+
+        double currentCpuMs = totalProcessorTimeMs.Value;
+        double? cpuPercent = null;
+
+        if (_prevCpuByPid.TryGetValue(pid, out var prev))
+        {
+            double deltaWallMs = (sampleUtc - prev.SampleUtc).TotalMilliseconds;
+            double deltaCpuMs = currentCpuMs - prev.TotalCpuMs;
+            if (deltaWallMs > 0 && deltaCpuMs >= 0 && processorCount > 0)
+            {
+                double rawPct = (deltaCpuMs / (deltaWallMs * processorCount)) * 100.0;
+                cpuPercent = Math.Round(Math.Clamp(rawPct, 0.0, 100.0), 1);
+            }
+        }
+
+        _prevCpuByPid[pid] = (currentCpuMs, sampleUtc);
+        return cpuPercent;
+    }
+
+    internal void PruneExitedPids(IReadOnlySet<int> activePids)
+    {
+        var stale = _prevCpuByPid.Keys.Where(pid => !activePids.Contains(pid)).ToList();
+        foreach (int pid in stale)
+        {
+            _prevCpuByPid.Remove(pid);
         }
     }
 
-    private static IisCollectionResult CollectViaServerManager(
+    internal int TrackedPidCount => _prevCpuByPid.Count;
+
+    private IisCollectionResult CollectViaServerManager(
         IReadOnlySet<string> appPoolFilter,
+        DateTimeOffset sampleUtc,
         List<string> warnings)
     {
         using var serverManager = new ServerManager();
@@ -119,6 +163,7 @@ public sealed partial class IisWorkerProcessCollector : IIisWorkerProcessCollect
             }
 
             var procStats = TryReadProcessMetrics(pid);
+            double? cpuPct = ComputeCpuPercent(pid, procStats.TotalProcessorTimeMs, sampleUtc, Environment.ProcessorCount);
             var boundSites = sitesByPool.TryGetValue(appPoolName, out var sites)
                 ? sites.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).Take(10).ToList()
                 : [];
@@ -134,14 +179,16 @@ public sealed partial class IisWorkerProcessCollector : IIisWorkerProcessCollect
                 TotalProcessorTimeMs: procStats.TotalProcessorTimeMs,
                 StartTimeUtc: procStats.StartTimeUtc,
                 ActiveRequests: activeRequests,
-                BoundSites: boundSites));
+                BoundSites: boundSites,
+                CpuPercent: cpuPct));
         }
 
         return new IisCollectionResult("IIS_ADMIN", workers, warnings);
     }
 
-    private static IisCollectionResult CollectViaWmiFallback(
+    private IisCollectionResult CollectViaWmiFallback(
         IReadOnlySet<string> appPoolFilter,
+        DateTimeOffset sampleUtc,
         List<string> warnings)
     {
         var workers = new List<IisWorkerProcessInfo>();
@@ -187,6 +234,7 @@ public sealed partial class IisWorkerProcessCollector : IIisWorkerProcessCollect
             }
 
             var procStats = TryReadProcessMetrics(pid);
+            double? cpuPct = ComputeCpuPercent(pid, procStats.TotalProcessorTimeMs, sampleUtc, Environment.ProcessorCount);
             workers.Add(new IisWorkerProcessInfo(
                 Pid: pid,
                 AppPoolName: appPoolName,
@@ -198,7 +246,8 @@ public sealed partial class IisWorkerProcessCollector : IIisWorkerProcessCollect
                 TotalProcessorTimeMs: procStats.TotalProcessorTimeMs,
                 StartTimeUtc: procStats.StartTimeUtc,
                 ActiveRequests: [],
-                BoundSites: []));
+                BoundSites: [],
+                CpuPercent: cpuPct));
         }
 
         return new IisCollectionResult("WMI_FALLBACK", workers, warnings);

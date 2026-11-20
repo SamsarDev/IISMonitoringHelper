@@ -1,28 +1,101 @@
+using System.Globalization;
 using IisMonitor.Abstractions;
+using IisMonitor.Collectors;
 using IisMonitor.Domain;
 
 namespace IisMonitor.Analysis;
 
 public sealed class AnomalyDetector : IAnomalyDetector
 {
+    private static readonly HashSet<string> CooldownExemptCodes = new(StringComparer.Ordinal)
+    {
+        "APPPOOL_RECYCLE_OR_CRASH",
+        "DB_POOL_TIMEOUT_EVENT",
+        "ASPNET_REQUESTS_REJECTED",
+        "CONNECTION_LEAK_RECLAIMED"
+    };
+
     private readonly Dictionary<string, int> _lastPidByAppPool = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, double> _lastReclaimedByInstance = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<(string Code, string Target), (DateTimeOffset EmittedAtUtc, AnomalySeverity Severity)> _cooldownState = new();
+    private double? _lastAspNetRequestsRejected;
 
     public IReadOnlyList<AnomalyEvent> Analyze(TelemetrySnapshot snapshot, MonitorConfig config)
     {
-        var anomalies = new List<AnomalyEvent>();
+        var rawAnomalies = new List<AnomalyEvent>();
         var t = config.Thresholds;
         var now = snapshot.TimestampUtc;
 
-        AnalyzeAppPoolRecyclesAndHungRequests(snapshot, t, now, anomalies);
-        AnalyzeAdoNetPools(snapshot, t, now, anomalies);
-        AnalyzeTcpSockets(snapshot, t, now, anomalies);
-        AnalyzeQueuesAndClr(snapshot, t, now, anomalies);
-        AnalyzeNodeProcesses(snapshot, t, now, anomalies);
-        AnalyzeEventLogs(snapshot, now, anomalies);
+        AnalyzeAppPoolRecyclesAndHungRequests(snapshot, t, now, rawAnomalies);
+        AnalyzeAdoNetPools(snapshot, t, now, rawAnomalies);
+        AnalyzeTcpSockets(snapshot, t, now, rawAnomalies);
+        AnalyzeQueuesAndClr(snapshot, t, now, rawAnomalies);
+        AnalyzeNodeProcesses(snapshot, config, t, now, rawAnomalies);
+        AnalyzeEventLogs(snapshot, now, rawAnomalies);
 
-        return anomalies;
+        return ApplyCooldown(rawAnomalies, now, config.AnomalyCooldownSeconds);
     }
+
+    private List<AnomalyEvent> ApplyCooldown(
+        List<AnomalyEvent> candidates,
+        DateTimeOffset nowUtc,
+        int cooldownSeconds)
+    {
+        if (cooldownSeconds <= 0 || candidates.Count == 0)
+        {
+            return candidates;
+        }
+
+        var cooldown = TimeSpan.FromSeconds(cooldownSeconds);
+        var emitted = new List<AnomalyEvent>(candidates.Count);
+
+        foreach (var anomaly in candidates)
+        {
+            if (CooldownExemptCodes.Contains(anomaly.Code))
+            {
+                emitted.Add(anomaly);
+                continue;
+            }
+
+            var key = (anomaly.Code, anomaly.TargetName.ToUpperInvariant());
+            var severity = ParseSeverity(anomaly.Severity);
+
+            if (_cooldownState.TryGetValue(key, out var prev))
+            {
+                bool withinCooldown = (nowUtc - prev.EmittedAtUtc) < cooldown;
+                bool escalated = severity > prev.Severity;
+
+                if (withinCooldown && !escalated)
+                {
+                    continue;
+                }
+            }
+
+            _cooldownState[key] = (nowUtc, severity);
+            emitted.Add(anomaly);
+        }
+
+        // Bound cooldown dictionary over long 72h runs.
+        if (_cooldownState.Count > 500)
+        {
+            var expiry = TimeSpan.FromSeconds(Math.Max(cooldownSeconds * 2, 3600));
+            var expiredKeys = _cooldownState
+                .Where(kv => (nowUtc - kv.Value.EmittedAtUtc) > expiry)
+                .Select(kv => kv.Key)
+                .ToList();
+            foreach (var k in expiredKeys)
+            {
+                _cooldownState.Remove(k);
+            }
+        }
+
+        return emitted;
+    }
+
+    private static AnomalySeverity ParseSeverity(string severity) =>
+        Enum.TryParse<AnomalySeverity>(severity, ignoreCase: true, out var parsed)
+            ? parsed
+            : AnomalySeverity.MEDIUM;
 
     private void AnalyzeAppPoolRecyclesAndHungRequests(
         TelemetrySnapshot snapshot,
@@ -261,7 +334,7 @@ public sealed class AnomalyDetector : IAnomalyDetector
         }
     }
 
-    private static void AnalyzeQueuesAndClr(
+    private void AnalyzeQueuesAndClr(
         TelemetrySnapshot snapshot,
         ThresholdConfig t,
         DateTimeOffset now,
@@ -285,6 +358,32 @@ public sealed class AnomalyDetector : IAnomalyDetector
                     ["requestsRejected"] = asp.RequestsRejected,
                     ["requestWaitTimeMs"] = asp.RequestWaitTimeMs
                 }));
+        }
+
+        if (asp?.RequestsRejected is { } rejected)
+        {
+            if (_lastAspNetRequestsRejected.HasValue)
+            {
+                double delta = rejected - _lastAspNetRequestsRejected.Value;
+                if (delta > 0)
+                {
+                    anomalies.Add(new AnomalyEvent(
+                        TimestampUtc: now,
+                        Severity: delta >= 10 ? nameof(AnomalySeverity.CRITICAL) : nameof(AnomalySeverity.HIGH),
+                        Code: "ASPNET_REQUESTS_REJECTED",
+                        TargetType: "Server",
+                        TargetName: "ASP.NET v4.0.30319",
+                        Pid: null,
+                        Summary: $"ASP.NET rejected {delta:0} request(s) since previous sample (total={rejected:0}, queued={asp.RequestsQueued:0}).",
+                        Metrics: new Dictionary<string, object?>
+                        {
+                            ["requestsRejectedDelta"] = delta,
+                            ["requestsRejectedTotal"] = rejected,
+                            ["requestsQueued"] = asp.RequestsQueued
+                        }));
+                }
+            }
+            _lastAspNetRequestsRejected = rejected;
         }
 
         foreach (var q in snapshot.AspNetAndClr.HttpQueues)
@@ -346,19 +445,48 @@ public sealed class AnomalyDetector : IAnomalyDetector
                         ["percentTimeInGc"] = clr.PercentTimeInGc
                     }));
             }
+
+            if (clr.PercentTimeInGc is { } gcPct && gcPct >= t.HighGcTimeWarningPercent)
+            {
+                string severity = gcPct >= t.HighGcTimeCriticalPercent
+                    ? nameof(AnomalySeverity.CRITICAL)
+                    : nameof(AnomalySeverity.HIGH);
+
+                anomalies.Add(new AnomalyEvent(
+                    TimestampUtc: now,
+                    Severity: severity,
+                    Code: "HIGH_GC_TIME",
+                    TargetType: clr.AppPoolName is not null ? "AppPool" : "ClrProcess",
+                    TargetName: target,
+                    Pid: clr.Pid,
+                    Summary: $"High CLR GC time on '{target}': {gcPct.ToString("0.#", CultureInfo.InvariantCulture)}% in GC (gen2={clr.Gen2HeapSizeMb?.ToString("0.#", CultureInfo.InvariantCulture) ?? "n/a"}MB, totalHeap={clr.TotalHeapSizeMb?.ToString("0.#", CultureInfo.InvariantCulture) ?? "n/a"}MB).",
+                    Metrics: new Dictionary<string, object?>
+                    {
+                        ["percentTimeInGc"] = gcPct,
+                        ["gen2HeapSizeMb"] = clr.Gen2HeapSizeMb,
+                        ["totalHeapSizeMb"] = clr.TotalHeapSizeMb
+                    }));
+            }
         }
     }
 
     private static void AnalyzeNodeProcesses(
         TelemetrySnapshot snapshot,
+        MonitorConfig config,
         ThresholdConfig t,
         DateTimeOffset now,
         List<AnomalyEvent> anomalies)
     {
         double zombieThresholdSec = t.NodeZombieUptimeMinutes * 60.0;
+        var ignorePatterns = config.GetNormalizedNodeIgnorePatterns();
 
         foreach (var node in snapshot.Node.Processes)
         {
+            if (ignorePatterns.Count > 0 && MatchesAnyIgnorePattern(node, ignorePatterns))
+            {
+                continue;
+            }
+
             if (!node.UptimeSeconds.HasValue || node.UptimeSeconds.Value < zombieThresholdSec)
             {
                 continue;
@@ -373,6 +501,11 @@ public sealed class AnomalyDetector : IAnomalyDetector
                     ? nameof(AnomalySeverity.HIGH)
                     : nameof(AnomalySeverity.MEDIUM);
 
+                string uptimeText = (node.UptimeSeconds.Value / 60.0).ToString("0.#", CultureInfo.InvariantCulture);
+                string cpuDeltaText = node.CpuDeltaMs.HasValue
+                    ? $"{node.CpuDeltaMs.Value.ToString("0.#", CultureInfo.InvariantCulture)}ms"
+                    : "n/a";
+
                 anomalies.Add(new AnomalyEvent(
                     TimestampUtc: now,
                     Severity: severity,
@@ -380,7 +513,7 @@ public sealed class AnomalyDetector : IAnomalyDetector
                     TargetType: "NodeJob",
                     TargetName: node.JobLabel,
                     Pid: node.Pid,
-                    Summary: $"Long-running Node.js job '{node.JobLabel}' (PID {node.Pid}) uptime={node.UptimeSeconds.Value / 60.0:0.1}m, DB sockets={dbOpen}, cpuDelta={node.CpuDeltaMs?.ToString("0.#") ?? "n/a"}ms.",
+                    Summary: $"Long-running Node.js job '{node.JobLabel}' (PID {node.Pid}) uptime={uptimeText}m, DB sockets={dbOpen}, cpuDelta={cpuDeltaText}.",
                     Metrics: new Dictionary<string, object?>
                     {
                         ["uptimeMinutes"] = Math.Round(node.UptimeSeconds.Value / 60.0, 1),
@@ -393,6 +526,19 @@ public sealed class AnomalyDetector : IAnomalyDetector
         }
     }
 
+    private static bool MatchesAnyIgnorePattern(NodeProcessSnapshot node, IReadOnlyList<string> patterns)
+    {
+        foreach (string pattern in patterns)
+        {
+            if (node.JobLabel.Contains(pattern, StringComparison.OrdinalIgnoreCase) ||
+                node.CommandLine.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static void AnalyzeEventLogs(
         TelemetrySnapshot snapshot,
         DateTimeOffset now,
@@ -402,6 +548,7 @@ public sealed class AnomalyDetector : IAnomalyDetector
         {
             if (ev.IsSqlPoolTimeout)
             {
+                string snippet = WindowsEventLogCollector.ExtractHighSignalSnippet(ev.Source, ev.EventId, ev.Message, 220);
                 anomalies.Add(new AnomalyEvent(
                     TimestampUtc: ev.TimestampUtc,
                     Severity: nameof(AnomalySeverity.CRITICAL),
@@ -409,7 +556,7 @@ public sealed class AnomalyDetector : IAnomalyDetector
                     TargetType: "EventLog",
                     TargetName: $"{ev.LogName}/{ev.Source}",
                     Pid: null,
-                    Summary: $"EventLog SQL connection pool timeout (EventID {ev.EventId}): {Truncate(ev.Message, 220)}",
+                    Summary: $"EventLog SQL connection pool timeout (EventID {ev.EventId}): {snippet}",
                     Metrics: new Dictionary<string, object?>
                     {
                         ["logName"] = ev.LogName,
@@ -421,6 +568,7 @@ public sealed class AnomalyDetector : IAnomalyDetector
 
             if (ev.IsWasRecycleOrCrash)
             {
+                string snippet = WindowsEventLogCollector.ExtractHighSignalSnippet(ev.Source, ev.EventId, ev.Message, 220);
                 anomalies.Add(new AnomalyEvent(
                     TimestampUtc: ev.TimestampUtc,
                     Severity: nameof(AnomalySeverity.HIGH),
@@ -428,7 +576,7 @@ public sealed class AnomalyDetector : IAnomalyDetector
                     TargetType: "EventLog",
                     TargetName: $"{ev.LogName}/{ev.Source}",
                     Pid: null,
-                    Summary: $"IIS/WAS recycle or crash event (EventID {ev.EventId}): {Truncate(ev.Message, 220)}",
+                    Summary: $"IIS/WAS recycle or crash event (EventID {ev.EventId}): {snippet}",
                     Metrics: new Dictionary<string, object?>
                     {
                         ["logName"] = ev.LogName,
@@ -439,7 +587,4 @@ public sealed class AnomalyDetector : IAnomalyDetector
             }
         }
     }
-
-    private static string Truncate(string text, int maxLen) =>
-        text.Length <= maxLen ? text : text[..maxLen] + "...";
 }
